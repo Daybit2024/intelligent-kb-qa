@@ -1,0 +1,23 @@
+# 大模型调用 / 环境变量
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# 阶段2：向量数据库 + MySQL
+pymilvus>=2.3.0
+pymysql>=1.1.0
+jieba>=0.42.1
+numpy>=1.24.0
+
+# 阶段2：检索层（ES 关键词检索 + 文档解析 + HTTP 调用）
+elasticsearch>=8.0.0,<9.0.0
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+pymupdf>=1.24.0
+requests>=2.31.0
+
+# 阶段2：检索 API 服务
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# 阶段3：RAG 服务 + Web 前端
+gradio>=6.0.0

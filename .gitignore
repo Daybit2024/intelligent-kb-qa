@@ -1,0 +1,19 @@
+# ===== 密钥与环境（绝不入库）=====
+.env
+
+# ===== Python =====
+.venv/
+__pycache__/
+*.pyc
+
+# ===== IDE =====
+.idea/
+
+# ===== 数据库数据卷（删了=清库，绝不入库）=====
+stage2-milvus/volumes/
+
+# ===== 可重建的评测缓存 =====
+stage3-rag-service/eval_judge_cache.json
+
+# ===== 系统杂项 =====
+.DS_Store
