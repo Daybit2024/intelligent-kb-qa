@@ -41,6 +41,21 @@ def test_split_by_window():
     assert all(c["source"] == "test.md" for c in chunks)
 
 
+def test_conversation_manager_trim():
+    """会话记忆：写入侧截断——超出上限的旧消息被自动丢弃"""
+    from rag_service import ConversationManager
+
+    m = ConversationManager()
+    for i in range(20):  # 20 轮 = 40 条消息
+        m.add("s1", "user", f"q{i}")
+        m.add("s1", "assistant", f"a{i}")
+
+    hist = m.conversations["s1"]
+    assert len(hist) == ConversationManager.MAX_HISTORY_MESSAGES
+    assert hist[0]["content"] == "q15"  # 剩余窗口 = 最近 5 轮（q15..a19）
+    assert hist[-1]["content"] == "a19"
+
+
 def test_split_by_heading():
     """标题切分：## / ### 层级与 section 命名正确"""
     from ingest import split_by_heading
@@ -82,6 +97,17 @@ def test_search_api_with_domain():
     body = resp.json()
     assert body["count"] >= 1
     assert all("domain" in item for item in body["results"])
+
+
+@pytest.mark.skipif(not _service_up("http://127.0.0.1:8000/health"), reason="检索服务(8000)未启动")
+def test_domains_endpoint_with_counts():
+    """领域表端点：每个领域携带文件数（引用计数，归零领域会被自动清除）"""
+    import requests
+    resp = requests.get("http://127.0.0.1:8000/domains", timeout=10)
+    assert resp.status_code == 200
+    domains = resp.json()["domains"]
+    assert domains
+    assert all("file_count" in d and d["file_count"] >= 1 for d in domains)
 
 
 @pytest.mark.skipif(not _service_up("http://127.0.0.1:8001/health"), reason="RAG 服务(8001)未启动")

@@ -7,6 +7,7 @@ RAG 知识库助手 — Gradio 聊天前端（端口 7860）
 """
 import json
 import sys
+import uuid
 
 sys.stdout.reconfigure(errors="replace")
 
@@ -23,6 +24,8 @@ RAG_API = "http://127.0.0.1:8001"
 def format_sources(meta: dict) -> str:
     """把 SSE 的 meta 事件格式化成来源面板 Markdown"""
     parts = []
+    if meta.get("low_confidence"):
+        parts.append("⚠️ **低置信**：检索相关度普遍较低，回答可能为拒答")
     dom = meta.get("domain") or "通用"
     conf = meta.get("intent_confidence")
     conf_s = f"（置信度 {conf:.2f}）" if isinstance(conf, (int, float)) else ""
@@ -31,6 +34,8 @@ def format_sources(meta: dict) -> str:
         line += " · 已领域过滤"
     parts.append(line)
 
+    if meta.get("rewritten_question"):
+        parts.append(f"**检索改写**：{meta['rewritten_question']}")
     n_exp = len(meta.get("expanded_queries") or [])
     if n_exp:
         parts.append(f"**查询扩展**：{n_exp} 条变体")
@@ -49,7 +54,7 @@ def format_sources(meta: dict) -> str:
     return "\n\n".join(parts) if parts else "（无元信息）"
 
 
-def stream_chat(message, top_k, enable_intent, enable_expansion):
+def stream_chat(message, top_k, enable_intent, enable_expansion, session_id=None):
     """生成器：调用 8001 SSE，逐块 yield (答案文本, 来源面板)"""
     payload = {
         "question": message,
@@ -57,11 +62,21 @@ def stream_chat(message, top_k, enable_intent, enable_expansion):
         "enable_intent": enable_intent,
         "enable_expansion": enable_expansion,
     }
+    if session_id:
+        payload["session_id"] = session_id
     try:
         resp = requests.post(f"{RAG_API}/chat/stream", json=payload, stream=True, timeout=300)
         resp.raise_for_status()
     except requests.exceptions.ConnectionError:
         yield "⚠️ RAG 服务(8001) 未启动——请先运行 stage3-rag-service/rag_service.py", ""
+        return
+    except requests.exceptions.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        yield f"⚠️ 服务返回错误（HTTP {e.response.status_code}）：{detail or e}", ""
         return
 
     answer, sources_md = "", "（检索中…）"
@@ -93,8 +108,9 @@ def build_demo():
     with gr.Blocks(title="RAG 知识库助手") as demo:
         gr.Markdown(
             "# 📚 RAG 知识库助手\n"
-            "多格式文档知识库（PDF/扫描件/Word/Markdown）· 混合检索 + RRF + 重排 · 流式回答"
+            "多格式文档知识库（PDF/扫描件/Word/Markdown）· 混合检索 + RRF + 重排 · 流式 + 多轮对话"
         )
+        session_state = gr.State(value=None)  # 浏览器会话的 session_id（多轮对话用）
         with gr.Row():
             with gr.Column(scale=7):
                 chatbot = gr.Chatbot(label="对话", height=520)
@@ -111,24 +127,30 @@ def build_demo():
                 gr.Markdown("### 🔍 检索详情")
                 sources_panel = gr.Markdown("（提问后显示引用来源 / 领域 / 耗时）")
 
-        def submit(message, history, top_k, ei, ee):
+        def submit(message, history, top_k, ei, ee, sid):
             if not (message or "").strip():
-                yield history, "（请输入问题）", ""
+                yield history, "（请输入问题）", "", sid
                 return
+            if not sid:
+                sid = uuid.uuid4().hex[:12]  # 新会话
             history = (history or []) + [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": "…"},
             ]
-            for partial, src in stream_chat(message, top_k, ei, ee):
+            for partial, src in stream_chat(message, top_k, ei, ee, session_id=sid):
                 history[-1]["content"] = partial or "…"
-                yield history, src, ""
+                yield history, src, "", sid
 
         msg.submit(
             submit,
-            [msg, chatbot, top_k, enable_intent, enable_expansion],
-            [chatbot, sources_panel, msg],
+            [msg, chatbot, top_k, enable_intent, enable_expansion, session_state],
+            [chatbot, sources_panel, msg, session_state],
         )
-        clear_btn.click(lambda: ([], "（提问后显示引用来源）"), None, [chatbot, sources_panel])
+        # 清空对话 = 同时开启新会话（旧上下文丢弃）
+        clear_btn.click(
+            lambda: ([], "（提问后显示引用来源）", None),
+            None, [chatbot, sources_panel, session_state],
+        )
 
     return demo
 

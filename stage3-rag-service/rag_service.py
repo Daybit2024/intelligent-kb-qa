@@ -322,14 +322,22 @@ def format_sources(contexts):
 # ==================== 多轮会话（内存版） ====================
 
 class ConversationManager:
-    """学习用内存实现；生产环境应替换为 Redis/MySQL（历史会随进程重启丢失、
-    也无法在多实例间共享——对应第 6 课的讨论）"""
+    """内存版会话历史（学习用；生产应替换为 Redis：TTL 自动过期 + 多实例共享 + LTRIM 截断）
+
+    每个会话最多保留 MAX_HISTORY_MESSAGES 条消息（默认 10 条 = 5 轮），
+    超出时【写入侧】自动丢弃最早的消息——与生成注入的读取窗口一致。"""
+
+    MAX_HISTORY_MESSAGES = 10
 
     def __init__(self):
         self.conversations = {}
 
     def add(self, session_id, role, content):
-        self.conversations.setdefault(session_id, []).append({"role": role, "content": content})
+        history = self.conversations.setdefault(session_id, [])
+        history.append({"role": role, "content": content})
+        # 写入侧截断：超限的旧消息立即丢弃（而非只在读取时截取）
+        if len(history) > self.MAX_HISTORY_MESSAGES:
+            del history[: len(history) - self.MAX_HISTORY_MESSAGES]
 
     def get(self, session_id, limit=10):
         return self.conversations.get(session_id, [])[-limit:]
@@ -354,16 +362,18 @@ app.add_middleware(
 
 
 class ChatRequest(BaseModel):
-    question: str
+    question: str = Field(..., max_length=2000, description="用户问题")
     # 实验定案：k∈[3,7] 为质量平台期（9.82~9.88，无显著差异），平台期内取偏小值省 token
     top_k: int = Field(4, ge=1, le=20)
     enable_intent: bool = Field(True, description="意图识别")
     enable_expansion: bool = Field(True, description="查询扩展")
     enable_domain_filter: bool = Field(True, description="领域过滤")
+    session_id: str | None = Field(None, max_length=100,
+                                   description="会话 ID（可选；提供则启用多轮：指代改写 + 历史注入，流式结束后回写会话）")
 
 
 class HistoryChatRequest(ChatRequest):
-    session_id: str = Field(..., description="会话 ID（多轮）")
+    session_id: str = Field(..., max_length=100, description="会话 ID（多轮）")
 
 
 class ChatResponse(BaseModel):
@@ -415,12 +425,27 @@ def chat(req: ChatRequest):
 
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest):
-    """SSE 流式：先发 meta（来源/领域），再逐块发答案"""
+    """SSE 流式：先发 meta（来源/领域），再逐块发答案。
+    携带 session_id 时启用多轮：检索用改写后的问题、生成携带历史，流式结束后回写会话。"""
+    history = manager.get(req.session_id) if req.session_id else []
+
+    search_question = req.question
+    rewrite_ms = 0.0
+    if history:
+        t0 = time.perf_counter()
+        try:
+            search_question = rewrite_question(req.question, history)
+        except Exception as e:
+            logger.warning(f"查询改写失败，用原问题检索: {e}")
+        rewrite_ms = round((time.perf_counter() - t0) * 1000, 1)
+
     result = rag_pipeline(
-        req.question, req.top_k, req.enable_intent, req.enable_expansion, req.enable_domain_filter
+        search_question, req.top_k, req.enable_intent, req.enable_expansion, req.enable_domain_filter
     )
+    result["timings"]["rewrite_ms"] = rewrite_ms
 
     def event_stream():
+        answer_parts = []
         try:
             meta = {
                 "type": "meta",
@@ -428,13 +453,19 @@ def chat_stream(req: ChatRequest):
                 "intent_confidence": result["intent"]["confidence"],
                 "domain_filtered": result["domain_filtered"],
                 "low_confidence": result["low_confidence"],
+                "rewritten_question": search_question if search_question != req.question else None,
                 "expanded_queries": result["expanded"],
                 "sources": format_sources(result["contexts"]),
                 "timings": result["timings"],
             }
             yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
-            for piece in generate_answer_stream(req.question, result["contexts"], low_confidence=result["low_confidence"]):
+            for piece in generate_answer_stream(req.question, result["contexts"], history=history,
+                                                low_confidence=result["low_confidence"]):
+                answer_parts.append(piece)
                 yield f"data: {json.dumps({'type': 'delta', 'content': piece}, ensure_ascii=False)}\n\n"
+            if req.session_id:
+                manager.add(req.session_id, "user", req.question)
+                manager.add(req.session_id, "assistant", "".join(answer_parts))
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error(f"[stream] 出错: {e}")

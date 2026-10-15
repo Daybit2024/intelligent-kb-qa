@@ -53,6 +53,7 @@ def ensure_schema():
                     format VARCHAR(20) COMMENT 'md / pdf / txt',
                     chunk_count INT DEFAULT 0,
                     status VARCHAR(20) DEFAULT 'done' COMMENT 'processing / done / failed',
+                    domain VARCHAR(50) DEFAULT 'general' COMMENT '文件领域（入库时 LLM 归类）',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB
@@ -63,6 +64,7 @@ def ensure_schema():
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     name VARCHAR(50) NOT NULL UNIQUE COMMENT '领域标识（英文小写）',
                     description VARCHAR(500) COMMENT '领域说明（供 LLM 归类与意图识别使用）',
+                    file_count INT DEFAULT 0 COMMENT '该领域的文件数（由 refresh_domain_counts 重算维护）',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB
             """)
@@ -104,13 +106,13 @@ def upsert_document(cur, filename, file_hash, fmt, chunk_count, status="done", d
 
 
 def list_domains():
-    """领域表全部条目：[{"name", "description"}]"""
+    """领域表全部条目：[{"name", "description", "file_count"}]"""
     conn = mysql_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT name, description FROM domains ORDER BY id")
+        cur.execute("SELECT name, description, file_count FROM domains ORDER BY id")
         rows = cur.fetchall()
     conn.close()
-    return [{"name": r[0], "description": r[1] or ""} for r in rows]
+    return [{"name": r[0], "description": r[1] or "", "file_count": r[2] or 0} for r in rows]
 
 
 def upsert_domain(name, description=""):
@@ -123,6 +125,33 @@ def upsert_domain(name, description=""):
         )
     conn.commit()
     conn.close()
+
+
+def refresh_domain_counts():
+    """按登记表重算各领域文件数；归零的领域自动删除。
+    采用"重算"而非"手动加减"：替换（旧域可能≠新域）/失败重试等路径不会产生计数漂移，
+    任何一次刷新都会自愈。（入库完成、删除文档后调用）"""
+    conn = mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE domains d SET file_count = ("
+            f" SELECT COUNT(*) FROM {config.MYSQL_DOC_TABLE} x WHERE x.domain = d.name)"
+        )
+        cur.execute("DELETE FROM domains WHERE file_count = 0")
+    conn.commit()
+    conn.close()
+
+
+def delete_document(filename):
+    """完整删除一份文档：三库数据 + 登记表 + 刷新领域文件数（归零领域自动清除）"""
+    n = purge_source(filename)
+    conn = mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(f"DELETE FROM {config.MYSQL_DOC_TABLE} WHERE filename=%s", (filename,))
+    conn.commit()
+    conn.close()
+    refresh_domain_counts()
+    return n
 
 
 def purge_source(filename):

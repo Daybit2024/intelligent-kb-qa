@@ -48,6 +48,7 @@ def setup_mysql():
                     source VARCHAR(500) COMMENT '来源文件',
                     section VARCHAR(500) COMMENT '所属章节',
                     keywords VARCHAR(1000) COMMENT 'jieba 提取的关键词（供关键词检索）',
+                    domain VARCHAR(50) DEFAULT 'general' COMMENT '领域（chunk 级元数据，供领域过滤）',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB
             """)

@@ -58,5 +58,4 @@ MYSQL_DOC_TABLE = "documents"   # 文件登记表（sha256 查重 / 增量入库
 WINDOW_TARGET_CHARS = 500     # 目标段长（字符）
 WINDOW_OVERLAP_RATIO = 0.15   # 相邻段重叠比例
 
-# ---------- 检索默认参数 ----------
-DEFAULT_TOP_K = 10
+# 检索条数默认值定义在服务层的请求模型中（rag_service.ChatRequest，top_k=4 为实验定案）

@@ -388,7 +388,10 @@ def ingest_file(path):
     conn.commit()
     conn.close()
 
-    print(f"✓ {filename} 入库完成: {len(ids)} 段")
+    # 10. 刷新领域文件数（覆盖替换场景；归零领域自动清除）
+    store.refresh_domain_counts()
+
+    print(f"✓ {filename} 入库完成: {len(ids)} 段（领域: {domain}）")
     return True
 
 

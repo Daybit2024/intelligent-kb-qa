@@ -33,7 +33,7 @@ app.add_middleware(
 # ==================== 请求/响应模型 ====================
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., description="检索问题")
+    query: str = Field(..., max_length=2000, description="检索问题")
     search_type: str = Field("hybrid", description="检索模式: vector / keyword / hybrid / rerank")
     top_k: int = Field(10, ge=1, le=50, description="返回条数")
 
@@ -55,8 +55,8 @@ class SearchResponse(BaseModel):
 
 
 class RerankRequest(BaseModel):
-    query: str = Field(..., description="用于精排的查询（通常是原始问题）")
-    ids: list[int] = Field(..., description="候选 chunk id 列表（先快速召回，再送这里精排）")
+    query: str = Field(..., max_length=2000, description="用于精排的查询（通常是原始问题）")
+    ids: list[int] = Field(..., max_length=200, description="候选 chunk id 列表（先快速召回，再送这里精排）")
     top_k: int = Field(10, ge=1, le=50, description="返回条数")
 
 
