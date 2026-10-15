@@ -1,0 +1,9 @@
+# 构建上下文排除（不把虚拟环境/数据卷/密钥打进镜像）
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+stage2-milvus/volumes/
+eval_judge_cache.json

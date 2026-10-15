@@ -36,6 +36,26 @@ flowchart TB
 **分层原则：MySQL 是唯一正本，Milvus 与 Elasticsearch 都是可随时重建的派生索引。**
 重建工具 `rebuild_indexes.py` 可分别重建两个索引；正文按 id 从 MySQL 回表获取。
 
+## 部署架构（云端网关 + 隧道回源）
+
+生产部署采用"轻量网关 + 本地算力回源"方案：全栈运行在本地 Docker，云服务器仅承担公网入口。
+
+```mermaid
+flowchart LR
+    U["公网用户"] -->|" :8080 · Basic Auth"| N["云服务器 Nginx<br/>（2C2G · 仅入口）"]
+    N -->|"SSH 反向隧道<br/>127.0.0.1:7860"| W["本地 Docker 全栈<br/>rag-web / rag-service / rag-api<br/>Milvus · Elasticsearch · MySQL"]
+```
+
+为什么这样部署：完整栈常驻内存约 2.7G，超出入门级云实例的承载能力，而本地机器算力充裕。
+于是云端只做三件事——反向代理、访问鉴权、隧道落点，其余全部回源本地。
+
+- **公网入口**：Nginx 反代（SSE 专用参数：关闭缓冲 + 长超时）+ Basic Auth 访问保护（防 API 额度滥用）
+- **隧道回源**：本地主动建立 SSH 反向隧道（家宽无需公网 IP），断线 5 秒自动重连，休眠唤醒自愈
+- **一键启停**：`deploy/start.bat` 自动拉起 Docker 全栈并从云端验证链路；`deploy/stop.bat` 一键下线
+- **容器化**：三个应用服务共用一个镜像（根目录 `Dockerfile`），`restart: unless-stopped` 随 Docker 自动恢复
+
+**取舍**：零额外成本实现完整栈上线；代价是演示可用性取决于本地机器开机状态——"按需一键开启"正是为这一约束设计的。
+
 ## 快速开始
 
 **前置要求**：Docker Desktop ｜ Python 3.11+ ｜ 一个 MySQL 8 实例 ｜ 阿里云百炼 API Key
@@ -115,13 +135,17 @@ pytest tests/ -v    # 单元测试 + 集成冒烟测试（服务离线时集成�
   服务间调用统一使用 `127.0.0.1` 后，检索耗时从 19.1s 降至 4.7s。
 - **静默 fallback 的危险**：领域过滤的"命中不足则回退"设计曾掩盖一处映射漏配（过滤静默失效）；
   修复后为回退路径增加了显式日志——**系统不该在无声中变差**。
+- **约束是架构的一部分**：部署时连续遇到两个"预期外"——Docker Hub 拉取被限速至 ~10KB/s（经镜像站取得同哈希产物解围）、
+  云实例实测内存仅为预期的 1/4——后者直接催生了"网关 + 隧道回源"的部署形态。**环境给的约束，最终都会写进架构里。**
 
 ## 项目结构
 
 ```
 RAG/
+├── Dockerfile                       # 应用镜像（检索/RAG/Web 三服务共用）
+├── deploy/                          # 上线运维：一键启停脚本（start / stop）
 ├── stage2-milvus/                   # 向量库与检索层
-│   ├── docker-compose.yml           #   Milvus 全家桶（etcd/MinIO/standalone/Attu）+ Elasticsearch
+│   ├── docker-compose.yml           #   Milvus 全家桶（etcd/MinIO/standalone/Attu）+ Elasticsearch + 应用服务
 │   ├── store.py                     #   共享数据层：三库连接、分词、哈希、领域表
 │   ├── ingest.py                    #   增量入库管道（多格式解析 / OCR 降级 / 领域归类 / 三库写入）
 │   ├── query_engine.py              #   四种检索（向量/关键词/混合/重排）+ 两阶段精排
@@ -150,8 +174,8 @@ RAG/
 
 ## 路线图
 
-- [ ] 服务容器化：自研服务 Dockerfile + 全栈 compose（含 MySQL 容器），一键部署
-- [ ] 配置外置：连接地址全部环境变量化，适配容器网络
+- [x] 服务容器化：应用镜像 + 全栈 compose，一键启停（MySQL 复用宿主机实例）
+- [x] 配置外置：连接地址全部环境变量化，适配容器网络
 - [ ] 评测扩展：多轮对话评测、拒答阈值随语料增长的再校准
 - [ ] 检索优化：查询扩展并行化、embedding 批量合并
 

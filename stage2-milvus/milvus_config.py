@@ -10,8 +10,9 @@ load_dotenv()
 # ---------- Milvus 配置 ----------
 # 注意：统一用 127.0.0.1 而非 localhost——Windows 下 localhost 会先试 IPv6(::1)，
 # 对只监听 IPv4 的本地服务会先卡约 2 秒超时再回退（实测踩坑，服务间调用务必 127.0.0.1）
-MILVUS_HOST = "127.0.0.1"
-MILVUS_PORT = 19530
+# 连接地址可用环境变量覆盖：本地开发走默认值；容器部署时由 compose 注入服务名（如 MILVUS_HOST=milvus）
+MILVUS_HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
+MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 COLLECTION_NAME = "ai_knowledge_base"
 EMBEDDING_DIM = 1024  # text-embedding-v4 的向量维度
 
@@ -34,16 +35,16 @@ EMBEDDING_MODEL = "text-embedding-v4"
 EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # ---------- MySQL 配置（内容库） ----------
-MYSQL_HOST = "127.0.0.1"
-MYSQL_PORT = 3306
-MYSQL_USER = "root"
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "123456")
-MYSQL_DATABASE = "rag"
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "rag")
 MYSQL_TABLE = "doc_chunks"
 
 # ---------- Elasticsearch 配置（关键词检索） ----------
-ES_HOST = "127.0.0.1"
-ES_PORT = 9200
+ES_HOST = os.getenv("ES_HOST", "127.0.0.1")
+ES_PORT = int(os.getenv("ES_PORT", "9200"))
 ES_INDEX = "doc_chunks"   # 索引只存 id + text_seg + source（正文回 MySQL 取）
 
 # ---------- 重排配置（百炼重排模型） ----------

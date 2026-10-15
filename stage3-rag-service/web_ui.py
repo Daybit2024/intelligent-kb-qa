@@ -6,6 +6,7 @@ RAG 知识库助手 — Gradio 聊天前端（端口 7860）
 依赖:  RAG 服务(8001，依赖检索服务 8000) 需先启动
 """
 import json
+import os
 import sys
 import uuid
 
@@ -18,7 +19,7 @@ load_dotenv()
 import requests
 import gradio as gr
 
-RAG_API = "http://127.0.0.1:8001"
+RAG_API = os.getenv("RAG_API", "http://127.0.0.1:8001")  # 容器部署由 compose 注入 http://rag:8001
 
 
 def format_sources(meta: dict) -> str:
@@ -166,4 +167,5 @@ if __name__ == "__main__":
     demo = build_demo()
     demo.queue()
     print("Gradio 界面: http://127.0.0.1:7860")
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    # 容器内由 compose 注入 BIND_HOST=0.0.0.0（否则端口映射无法从容器外访问）
+    demo.launch(server_name=os.getenv("BIND_HOST", "127.0.0.1"), server_port=7860)

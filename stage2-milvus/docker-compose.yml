@@ -1,6 +1,7 @@
 services:
   etcd:
     container_name: milvus-etcd
+    restart: unless-stopped
     image: quay.io/coreos/etcd:v3.5.5
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
@@ -18,6 +19,7 @@ services:
 
   minio:
     container_name: milvus-minio
+    restart: unless-stopped
     # MinIO 官方 2025-10 删除了全部免费镜像，改用社区按官方源码重建的版本（最后一代社区版 RELEASE.2025-09-07）
     image: ghcr.io/netvark/minio:RELEASE.2025-09-07T16-13-09Z
     environment:
@@ -37,6 +39,7 @@ services:
 
   standalone:
     container_name: milvus-standalone
+    restart: unless-stopped
     image: milvusdb/milvus:v2.3.3
     command: ["milvus", "run", "standalone"]
     environment:
@@ -59,6 +62,7 @@ services:
 
   attu:
     container_name: milvus-attu
+    restart: unless-stopped
     image: zilliz/attu:v2.3.4
     environment:
       MILVUS_URL: milvus-standalone:19530
@@ -69,6 +73,7 @@ services:
 
   elasticsearch:
     container_name: rag-es
+    restart: unless-stopped
     image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
     environment:
       - discovery.type=single-node        # 单节点模式
@@ -83,6 +88,56 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+
+  # ===== 应用服务：检索(8000) / RAG(8001) / Web UI(7860)，共用 rag-app 镜像 =====
+  # restart 策略：随 Docker 自启（开机恢复），手动 compose stop 后不复活（配合 stop 脚本）
+  api:
+    container_name: rag-api
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rag-app:latest
+    command: python stage2-milvus/api_server.py
+    env_file: ../.env                     # 注入 DASHSCOPE_API_KEY / MYSQL_PASSWORD
+    environment:
+      MILVUS_HOST: standalone             # 容器网络内按服务名解析
+      ES_HOST: elasticsearch
+      MYSQL_HOST: host.docker.internal    # 用宿主机（Windows）上的 MySQL 服务
+    restart: unless-stopped
+    depends_on:
+      - standalone
+      - elasticsearch
+
+  rag:
+    container_name: rag-service
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rag-app:latest
+    command: python stage3-rag-service/rag_service.py
+    env_file: ../.env
+    environment:
+      SEARCH_API: http://api:8000
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  web:
+    container_name: rag-web
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rag-app:latest
+    command: python stage3-rag-service/web_ui.py
+    env_file: ../.env
+    environment:
+      RAG_API: http://rag:8001
+      BIND_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:7860:7860"             # 仅回环：对外由 SSH 隧道 + 云端 Nginx 提供
+    restart: unless-stopped
+    depends_on:
+      - rag
 
 networks:
   default:

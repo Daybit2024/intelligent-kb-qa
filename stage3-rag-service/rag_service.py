@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("rag_service")
 
-SEARCH_API = "http://127.0.0.1:8000"   # stage2 检索服务（127.0.0.1 而非 localhost，避免 IPv6 回退 2 秒延迟）
+SEARCH_API = os.getenv("SEARCH_API", "http://127.0.0.1:8000")   # 检索服务地址（容器部署由 compose 注入 http://api:8000；默认 127.0.0.1 而非 localhost 避免 IPv6 回退 2 秒）
 LLM_MODEL = "qwen-plus"
 
 llm = OpenAI(
