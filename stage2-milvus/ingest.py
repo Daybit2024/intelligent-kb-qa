@@ -78,16 +78,128 @@ def _ocr_pdf(path):
     return "\n\n".join(texts)
 
 
+def _row_span_and_gap(row):
+    """一行的横向跨度与"段间最大空隙"（词按 x 排序后相邻间隔的最大值）"""
+    xs = sorted((w["x0"], w["x1"]) for w in row)
+    span = xs[-1][1] - xs[0][0]
+    gap = max([0.0] + [b0 - a1 for (_, a1), (b0, _) in zip(xs, xs[1:])])
+    return span, gap
+
+
+def _row_is_full_width(row, page):
+    """整行 = 跨度≥70%页宽 且 内部无栏级空隙（单个连续段）
+
+    双栏页里"左右两栏各一个词恰好同行"的组合会因中间存在栏间距空隙
+    （一般 ≥2% 页宽）而不满足，不会把正文行误判成整行。
+    """
+    span, gap = _row_span_and_gap(row)
+    return span >= page.width * 0.7 and gap < page.width * 0.015
+
+
+def _detect_columns(page):
+    """双栏版面检测：返回 (分栏线x, 正文起始y)；非双栏返回 (None, None)
+
+    原理：双栏正文之间存在一条贯穿上下的"零穿越"纵向走廊——没有任何正文词横跨它。
+    标题/作者这类横跨版面的整行先识别剔除，不参与走廊判定，避免误伤检测。
+    """
+    words = page.extract_words()
+    if len(words) < 15:
+        return None, None
+
+    # 聚行：按 top 把词归并成行（容差 3pt）
+    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    rows, cur = [], [words[0]]
+    for w in words[1:]:
+        if abs(w["top"] - cur[0]["top"]) <= 3:
+            cur.append(w)
+        else:
+            rows.append(cur)
+            cur = [w]
+    rows.append(cur)
+
+    body_words = [w for row in rows if not _row_is_full_width(row, page) for w in row]
+    # 页眉/页脚带（上下 6%）的居中文字（页码等）可能横跨走廊，排除出判定集
+    y0, y1 = page.height * 0.06, page.height * 0.94
+    body_words = [w for w in body_words if w["top"] >= y0 and w["bottom"] <= y1]
+    if len(body_words) < 12:
+        return None, None
+
+    # 在页宽 25%~75% 扫走廊；允许 ≤2 个词穿越（容忍个别居中短元素，如封面式小标题）
+    lo, hi = page.width * 0.25, page.width * 0.75
+    runs, start = [], None
+    for x in range(int(lo), int(hi) + 1, 2):
+        crossing = sum(1 for w in body_words if w["x0"] < x < w["x1"])
+        if crossing <= 2:
+            if start is None:
+                start = x
+        elif start is not None:
+            runs.append((start, x))
+            start = None
+    if start is not None:
+        runs.append((start, int(hi)))
+    if not runs:
+        return None, None
+
+    a, b = max(runs, key=lambda r: r[1] - r[0])
+    if b - a < page.width * 0.015:      # 走廊过窄 → 只是词间空白，不是栏间距
+        return None, None
+    split = (a + b) / 2
+
+    # 两侧词量都要够（各 ≥25%），排除"单栏正文 + 大片页边空白"的误判
+    n_left = sum(1 for w in body_words if w["x1"] <= split)
+    n_right = sum(1 for w in body_words if w["x0"] >= split)
+    if n_left < len(body_words) * 0.25 or n_right < len(body_words) * 0.25:
+        return None, None
+
+    # 横跨走廊的词 = 整行元素（标题/作者等）——走廊能成立，正是因为正文词从不跨它，
+    # 少数被容许穿越的（每扫描点 ≤2 个）就是这类元素
+    wide_ids = {
+        id(w)
+        for row in rows for w in row
+        if any(w["x0"] < x < w["x1"] for x in range(a, b, 2))
+    }
+    # 正文起始 y：从页顶连续、含整行元素的行（标题区）之下即为正文
+    top_y = 0.0
+    for row in rows:
+        if not any(id(w) in wide_ids for w in row):
+            break
+        top_y = max(w["bottom"] for w in row)
+    return split, top_y
+
+
+def _extract_page_text(page, page_no=None):
+    """单页文字提取：双栏页面按"整行标题 → 左栏 → 右栏"的阅读顺序输出"""
+    split, top_y = _detect_columns(page)
+    if split is None:
+        return page.extract_text() or ""
+
+    if page_no:
+        print(f"    第 {page_no} 页：检测到双栏版面，按左栏→右栏还原阅读顺序")
+    parts = []
+    # 正文裁剪线下移 2pt：标题字符底边恰好等于裁剪线时会因浮点相等被重复裁进两侧
+    cut = top_y + 2 if top_y > 0 else 0.0
+    if cut > 0:
+        head = page.crop((0, 0, page.width, cut)).extract_text() or ""
+        if head.strip():
+            parts.append(head)
+    for x0, x1 in ((0, split), (split, page.width)):
+        col = page.crop((x0, cut, x1, page.height)).extract_text() or ""
+        if col.strip():
+            parts.append(col)
+    return "\n\n".join(parts)
+
+
 def parse_pdf(path):
-    """PDF 智能解析：先用 pdfplumber 抽文字；文字量过少（图片版/扫描版）自动切换 OCR"""
+    """PDF 智能解析：先用 pdfplumber 抽文字（双栏页面自动按栏还原阅读顺序）；
+    文字量过少（图片版/扫描版）自动切换 OCR"""
     import pdfplumber
 
     pages = []
     n_pages = 0
     with pdfplumber.open(path) as pdf:
         n_pages = len(pdf.pages)
-        for page in pdf.pages:
-            text = page.extract_text() or ""
+        for i, page in enumerate(pdf.pages, 1):
+            text = _extract_page_text(page, page_no=i)
             if text.strip():
                 pages.append(text)
     content = "\n\n".join(pages)
