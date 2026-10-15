@@ -58,6 +58,9 @@ def load_domains():
         logger.warning(f"领域表读取失败（沿用缓存）: {e}")
         return _domain_cache["domains"]
 
+# 拒答阈值（评测校准：33 可答 vs 10 陷阱的 top1 重排分最优分割点，有效区间 [0.136, 0.197]）
+LOW_CONFIDENCE_THRESHOLD = 0.15
+
 SYSTEM_PROMPT = (
     "你是一个严谨的知识库问答助手，请只根据提供的参考资料回答问题。规则：\n"
     "1. 如果参考资料与问题无关、或不足以回答，请明确说明“资料中没有相关内容”，不要编造，也不要用你自己的常识补充；\n"
@@ -232,7 +235,7 @@ def apply_domain_filter(candidates, domain):
 
 # ==================== 生成 ====================
 
-def build_messages(question, contexts, history=None):
+def build_messages(question, contexts, history=None, low_confidence=False):
     if contexts:
         refs = "\n\n".join(
             f"[参考{i + 1}]（{c['source']} · {c['section']}）\n{c['text']}"
@@ -240,25 +243,32 @@ def build_messages(question, contexts, history=None):
         )
     else:
         refs = "（没有检索到任何参考资料）"
+
+    # 低置信信号（评测校准的阈值）：提醒模型这批资料可能答不了，别勉强作答
+    hint = ""
+    if low_confidence:
+        hint = ("【系统提示】本次检索结果与问题的相关度普遍较低。"
+                "若参考资料确实无法回答问题，请直接说明“资料中没有相关内容”，不要勉强作答。\n\n")
+
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         msgs.extend(history)
-    msgs.append({"role": "user", "content": f"参考资料：\n{refs}\n\n问题：{question}"})
+    msgs.append({"role": "user", "content": f"{hint}参考资料：\n{refs}\n\n问题：{question}"})
     return msgs
 
 
-def generate_answer(question, contexts, history=None):
+def generate_answer(question, contexts, history=None, low_confidence=False):
     resp = llm.chat.completions.create(
         model=LLM_MODEL, temperature=0.3, max_tokens=1500,
-        messages=build_messages(question, contexts, history),
+        messages=build_messages(question, contexts, history, low_confidence),
     )
     return resp.choices[0].message.content
 
 
-def generate_answer_stream(question, contexts, history=None):
+def generate_answer_stream(question, contexts, history=None, low_confidence=False):
     stream = llm.chat.completions.create(
         model=LLM_MODEL, temperature=0.3, max_tokens=1500,
-        messages=build_messages(question, contexts, history), stream=True,
+        messages=build_messages(question, contexts, history, low_confidence), stream=True,
     )
     for chunk in stream:
         if chunk.choices and chunk.choices[0].delta.content:
@@ -287,11 +297,17 @@ def rag_pipeline(question, top_k, enable_intent, enable_expansion, enable_domain
     if enable_domain_filter and enable_intent:
         candidates, filtered = apply_domain_filter(candidates, intent["domain"])
 
+    contexts = candidates[:top_k]
+    top_score = max((c.get("scores", {}).get("rerank", 0.0) for c in contexts), default=0.0)
+    low_confidence = top_score < LOW_CONFIDENCE_THRESHOLD
+
     return {
-        "contexts": candidates[:top_k],
+        "contexts": contexts,
         "expanded": expanded,
         "intent": intent,
         "domain_filtered": filtered,
+        "low_confidence": low_confidence,
+        "top_score": round(top_score, 4),
         "timings": timings,
     }
 
@@ -353,6 +369,7 @@ class HistoryChatRequest(ChatRequest):
 class ChatResponse(BaseModel):
     question: str
     rewritten_question: str | None = None   # 多轮时：改写后用于检索的独立问题
+    low_confidence: bool = False            # 检索最高重排分低于校准阈值（t≈0.15）
     answer: str
     domain: str | None
     intent_confidence: float | None
@@ -374,15 +391,17 @@ def chat(req: ChatRequest):
         req.question, req.top_k, req.enable_intent, req.enable_expansion, req.enable_domain_filter
     )
     t0 = time.perf_counter()
-    answer = generate_answer(req.question, result["contexts"])
+    answer = generate_answer(req.question, result["contexts"], low_confidence=result["low_confidence"])
     result["timings"]["generation_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
     logger.info(
         f"[chat] domain={result['intent']['domain']} 扩展{len(result['expanded'])}条 "
-        f"命中{len(result['contexts'])}条 域过滤={result['domain_filtered']} {result['timings']}"
+        f"命中{len(result['contexts'])}条 域过滤={result['domain_filtered']} "
+        f"低置信={result['low_confidence']}(top={result['top_score']}) {result['timings']}"
     )
     return ChatResponse(
         question=req.question,
+        low_confidence=result["low_confidence"],
         answer=answer,
         domain=result["intent"]["domain"],
         intent_confidence=result["intent"]["confidence"],
@@ -408,12 +427,13 @@ def chat_stream(req: ChatRequest):
                 "domain": result["intent"]["domain"],
                 "intent_confidence": result["intent"]["confidence"],
                 "domain_filtered": result["domain_filtered"],
+                "low_confidence": result["low_confidence"],
                 "expanded_queries": result["expanded"],
                 "sources": format_sources(result["contexts"]),
                 "timings": result["timings"],
             }
             yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
-            for piece in generate_answer_stream(req.question, result["contexts"]):
+            for piece in generate_answer_stream(req.question, result["contexts"], low_confidence=result["low_confidence"]):
                 yield f"data: {json.dumps({'type': 'delta', 'content': piece}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
@@ -445,7 +465,8 @@ def chat_with_history(req: HistoryChatRequest):
     result["timings"]["rewrite_ms"] = rewrite_ms
 
     t0 = time.perf_counter()
-    answer = generate_answer(req.question, result["contexts"], history=history)
+    answer = generate_answer(req.question, result["contexts"], history=history,
+                             low_confidence=result["low_confidence"])
     result["timings"]["generation_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
     manager.add(req.session_id, "user", req.question)
@@ -458,6 +479,7 @@ def chat_with_history(req: HistoryChatRequest):
     return ChatResponse(
         question=req.question,
         rewritten_question=search_question if search_question != req.question else None,
+        low_confidence=result["low_confidence"],
         answer=answer,
         domain=result["intent"]["domain"],
         intent_confidence=result["intent"]["confidence"],

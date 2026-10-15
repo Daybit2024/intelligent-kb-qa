@@ -21,3 +21,6 @@ uvicorn>=0.23.0
 
 # 阶段3：RAG 服务 + Web 前端
 gradio>=6.0.0
+
+# 开发/测试
+pytest>=8.0.0
