@@ -143,6 +143,7 @@ def rerank_documents(query: str, ids: list, top_k: int = 10):
             "text": m["text"],
             "source": m["source"],
             "section": m["section"],
+            "domain": m.get("domain", ""),
             "scores": {"rerank": r["relevance_score"]},
         })
     return out
@@ -158,13 +159,13 @@ def fetch_texts(ids):
     placeholders = ",".join(["%s"] * len(ids))
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT id, text, source, section FROM {config.MYSQL_TABLE} "
+            f"SELECT id, text, source, section, domain FROM {config.MYSQL_TABLE} "
             f"WHERE id IN ({placeholders})",
             ids,
         )
         rows = cur.fetchall()
     conn.close()
-    return {r[0]: {"text": r[1], "source": r[2], "section": r[3]} for r in rows}
+    return {r[0]: {"text": r[1], "source": r[2], "section": r[3], "domain": r[4]} for r in rows}
 
 
 # ==================== 展示 ====================

@@ -13,6 +13,7 @@
   哈希未变    → 跳过
   哈希变了    → 按来源清理旧数据后重插（替换）
 """
+import json
 import os
 import re
 import shutil
@@ -22,12 +23,15 @@ sys.stdout.reconfigure(errors="replace")
 
 import jieba.analyse
 from elasticsearch.helpers import bulk
+from openai import OpenAI
 from pymilvus import connections
 
 import store
 import milvus_config as config
 
 MAX_TEXT_CHARS = 7000  # 单段上限（embedding 输入 / MySQL TEXT 字段保护）
+
+_llm_client = OpenAI(api_key=config.DASHSCOPE_API_KEY, base_url=config.EMBEDDING_BASE_URL)
 
 
 # ==================== 解析器（可插拔后端） ====================
@@ -124,6 +128,61 @@ def parse_docx(path):
 
 
 PARSERS = {".md": parse_markdown, ".txt": parse_txt, ".pdf": parse_pdf, ".docx": parse_docx}
+
+
+# ==================== 领域归类（数据驱动） ====================
+
+DOMAIN_PROMPT = (
+    "你在为一个知识库做领域归类。现有领域如下（name：说明）：\n"
+    "{existing}\n\n"
+    "请阅读文档节选，判断它属于哪个现有领域；若都不匹配，请创建一个新的简短领域名"
+    "（英文小写单词，如 medical），并给出一句中文说明。注意：能复用现有领域时必须复用，不要造近义词。\n"
+    '只输出 JSON：{"domain": "领域名", "is_new": true 或 false, "description": "一句中文说明"}'
+)
+
+
+def _extract_json(text):
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group())
+    except Exception:
+        return None
+
+
+def determine_domain(content):
+    """让模型通读文档节选 → 复用现有领域或新建（新领域写入领域表）；失败按 general 兜底"""
+    existing = store.list_domains()
+    existing_names = {d["name"] for d in existing}
+    existing_txt = "\n".join(
+        f"- {d['name']}：{d['description'] or '（无说明）'}" for d in existing
+    ) or "- （暂无领域）"
+    try:
+        resp = _llm_client.chat.completions.create(
+            model="qwen-plus", temperature=0.1, max_tokens=200,
+            messages=[
+                # 用 replace 而非 format：prompt 里的 JSON 示例含花括号，会被 format 误当占位符
+                {"role": "system", "content": DOMAIN_PROMPT.replace("{existing}", existing_txt)},
+                {"role": "user", "content": f"文档节选：\n{content[:2000]}"},
+            ],
+        )
+        data = _extract_json(resp.choices[0].message.content)
+    except Exception as e:
+        print(f"  领域归类失败（按 general 处理）: {e}")
+        return "general"
+    if not data or not data.get("domain"):
+        return "general"
+    name = re.sub(r"[^a-z0-9_\-]", "", str(data["domain"]).strip().lower())[:50]
+    if not name:
+        return "general"
+    desc = str(data.get("description", ""))[:500]
+    if name in existing_names:
+        print(f"  领域归类: 复用现有领域「{name}」")
+    else:
+        store.upsert_domain(name, desc)
+        print(f"  领域归类: 新建领域「{name}」（{desc}）")
+    return name
 
 
 # ==================== 切分器（两种策略） ====================
@@ -270,10 +329,13 @@ def ingest_file(path):
             c["text"] = c["text"][:MAX_TEXT_CHARS]
     print(f"  切分完成: {len(chunks)} 段")
 
+    # 3.5 领域归类（数据驱动：优先复用现有领域，否则新建并入领域表）
+    domain = determine_domain(content)
+
     # 4. 登记 processing 状态（失败可重跑）
     conn = store.mysql_conn()
     with conn.cursor() as cur:
-        store.upsert_document(cur, filename, fhash, ext.lstrip("."), 0, status="processing")
+        store.upsert_document(cur, filename, fhash, ext.lstrip("."), 0, status="processing", domain=domain)
     conn.commit()
 
     # 5. 向量化
@@ -287,9 +349,9 @@ def ingest_file(path):
         for c in chunks:
             keywords = " ".join(jieba.analyse.extract_tags(c["text"], topK=10))
             cur.execute(
-                f"INSERT INTO {config.MYSQL_TABLE} (text, source, section, keywords) "
-                f"VALUES (%s, %s, %s, %s)",
-                (c["text"], c["source"], c["section"], keywords),
+                f"INSERT INTO {config.MYSQL_TABLE} (text, source, section, keywords, domain) "
+                f"VALUES (%s, %s, %s, %s, %s)",
+                (c["text"], c["source"], c["section"], keywords, domain),
             )
             ids.append(cur.lastrowid)
     conn.commit()
@@ -322,7 +384,7 @@ def ingest_file(path):
     # 9. 标记完成
     conn = store.mysql_conn()
     with conn.cursor() as cur:
-        store.upsert_document(cur, filename, fhash, ext.lstrip("."), len(ids), status="done")
+        store.upsert_document(cur, filename, fhash, ext.lstrip("."), len(ids), status="done", domain=domain)
     conn.commit()
     conn.close()
 

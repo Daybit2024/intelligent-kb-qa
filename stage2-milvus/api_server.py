@@ -43,6 +43,7 @@ class ResultItem(BaseModel):
     text: str
     source: str
     section: str
+    domain: str = ""   # 领域元数据（供上层领域过滤）
     scores: dict  # 按模式不同: distance / score(BM25) / rrf+各路排名 / rerank+rrf+排名
 
 
@@ -89,6 +90,7 @@ def search(req: SearchRequest):
             text=meta.get("text", ""),
             source=meta.get("source", ""),
             section=meta.get("section", ""),
+            domain=meta.get("domain", ""),
             scores={k: v for k, v in r.items() if k != "id"},
         ))
     return SearchResponse(
@@ -101,6 +103,12 @@ def rerank(req: RerankRequest):
     """对给定的候选 id 列表做一次精排（两阶段检索的第二阶段：快速召回 → 一次性重排）"""
     results = qe.rerank_documents(req.query, req.ids, req.top_k)
     return {"query": req.query, "count": len(results), "results": results}
+
+
+@app.get("/domains")
+def domains():
+    """领域表（供 RAG 服务的意图识别动态加载）"""
+    return {"domains": store.list_domains()}
 
 
 @app.get("/stats")

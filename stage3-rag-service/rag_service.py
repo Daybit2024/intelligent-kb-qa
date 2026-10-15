@@ -37,13 +37,26 @@ llm = OpenAI(
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
-# 领域 → 来源文件（领域过滤用；文件在 documents/ 里）
-DOMAIN_SOURCES = {
-    "ai": ["ai_dev.md"],
-    "finance": ["fin.md", "金融分析报告.pdf"],
-    "law": ["law.md"],
-}
-DOMAIN_NAMES = {"law": "法律", "finance": "金融", "ai": "人工智能", "general": "通用"}
+# 领域路由为数据驱动：类目清单与过滤映射全部来自领域表（经 8000 /domains 暴露），本服务不硬编码领域
+DOMAIN_CACHE_TTL = 60  # 秒：新领域入库后，最多 60 秒被意图识别自动感知
+_domain_cache = {"ts": 0.0, "domains": []}
+
+
+def load_domains():
+    """读取领域表（带 TTL 缓存；读取失败沿用旧缓存，最坏情况为空表 → 全部按 general 处理）"""
+    now = time.time()
+    if _domain_cache["domains"] and now - _domain_cache["ts"] < DOMAIN_CACHE_TTL:
+        return _domain_cache["domains"]
+    try:
+        resp = requests.get(f"{SEARCH_API}/domains", timeout=10)
+        resp.raise_for_status()
+        domains = resp.json().get("domains", [])
+        _domain_cache["ts"] = now
+        _domain_cache["domains"] = domains
+        return domains
+    except Exception as e:
+        logger.warning(f"领域表读取失败（沿用缓存）: {e}")
+        return _domain_cache["domains"]
 
 SYSTEM_PROMPT = (
     "你是一个严谨的知识库问答助手，请只根据提供的参考资料回答问题。规则：\n"
@@ -52,11 +65,7 @@ SYSTEM_PROMPT = (
     "3. 回答简洁清晰。"
 )
 
-INTENT_PROMPT = (
-    "你是意图分类器。请把用户问题分类到以下领域之一：\n"
-    "- law（法律）\n- finance（金融）\n- ai（人工智能）\n- general（通用，不属于以上领域）\n\n"
-    '只输出一个 JSON，格式：{"domain": "xxx", "confidence": 0.9, "reason": "简短理由"}'
-)
+# 意图识别的类目清单不再硬编码——由 detect_intent 从领域表动态构建
 
 EXPANSION_PROMPT = (
     "请为下面的问题生成 3 个语义相同但表述不同的检索查询（用于提升检索召回）。\n"
@@ -82,15 +91,25 @@ def _extract_json(text):
 
 
 def detect_intent(question):
+    """意图识别：类目清单从领域表动态构建（领域表新增领域后自动生效）"""
+    domains = load_domains()
+    valid = {d["name"] for d in domains} | {"general"}
+    lines = "\n".join(f"- {d['name']}（{d.get('description') or '无说明'}）" for d in domains)
+    prompt = (
+        "你是意图分类器。请把用户问题分类到以下领域之一：\n"
+        f"{lines}\n"
+        "- general（通用，不属于以上任何领域）\n\n"
+        '只输出一个 JSON，格式：{"domain": "xxx", "confidence": 0.9, "reason": "简短理由"}'
+    )
     resp = llm.chat.completions.create(
         model=LLM_MODEL, temperature=0.1, max_tokens=200,
         messages=[
-            {"role": "system", "content": INTENT_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": question},
         ],
     )
     data = _extract_json(resp.choices[0].message.content)
-    if not data or data.get("domain") not in DOMAIN_NAMES:
+    if not data or data.get("domain") not in valid:
         return {"domain": "general", "confidence": 0.0, "reason": "解析失败，按通用处理"}
     return {
         "domain": data["domain"],
@@ -201,13 +220,13 @@ def retrieve_candidates(question, top_k, enable_expansion):
 
 
 def apply_domain_filter(candidates, domain):
-    """领域过滤：按来源筛；命中不足 3 条则回退不筛"""
-    sources = DOMAIN_SOURCES.get(domain)
-    if not sources:
+    """领域过滤：按检索结果携带的 chunk domain 元数据筛选；命中不足 3 条则回退（打警告）"""
+    if not domain or domain == "general":
         return candidates, False
-    filtered = [c for c in candidates if c["source"] in sources]
+    filtered = [c for c in candidates if c.get("domain") == domain]
     if len(filtered) >= 3:
         return filtered, True
+    logger.warning(f"领域过滤回退：{domain} 仅命中 {len(filtered)} 条（<3），保留未过滤结果")
     return candidates, False
 
 

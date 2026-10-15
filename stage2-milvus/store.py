@@ -57,6 +57,15 @@ def ensure_schema():
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB
             """)
+            # 领域表（数据驱动的领域路由；新装环境首次入库时自动获得）
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS domains (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(50) NOT NULL UNIQUE COMMENT '领域标识（英文小写）',
+                    description VARCHAR(500) COMMENT '领域说明（供 LLM 归类与意图识别使用）',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB
+            """)
             cur.execute(f"SELECT COUNT(*) FROM {config.MYSQL_DOC_TABLE}")
             if cur.fetchone()[0] == 0:
                 # 存量迁移：doc_chunks 里已有来源但还没登记过 → 自动补登记
@@ -84,14 +93,36 @@ def get_document(cur, filename):
     return cur.fetchone()
 
 
-def upsert_document(cur, filename, file_hash, fmt, chunk_count, status="done"):
+def upsert_document(cur, filename, file_hash, fmt, chunk_count, status="done", domain="general"):
     cur.execute(
-        f"INSERT INTO {config.MYSQL_DOC_TABLE} (filename, file_hash, format, chunk_count, status) "
-        f"VALUES (%s, %s, %s, %s, %s) "
+        f"INSERT INTO {config.MYSQL_DOC_TABLE} (filename, file_hash, format, chunk_count, status, domain) "
+        f"VALUES (%s, %s, %s, %s, %s, %s) "
         f"ON DUPLICATE KEY UPDATE file_hash=VALUES(file_hash), format=VALUES(format), "
-        f"chunk_count=VALUES(chunk_count), status=VALUES(status)",
-        (filename, file_hash, fmt, chunk_count, status),
+        f"chunk_count=VALUES(chunk_count), status=VALUES(status), domain=VALUES(domain)",
+        (filename, file_hash, fmt, chunk_count, status, domain),
     )
+
+
+def list_domains():
+    """领域表全部条目：[{"name", "description"}]"""
+    conn = mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT name, description FROM domains ORDER BY id")
+        rows = cur.fetchall()
+    conn.close()
+    return [{"name": r[0], "description": r[1] or ""} for r in rows]
+
+
+def upsert_domain(name, description=""):
+    conn = mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO domains (name, description) VALUES (%s, %s) "
+            "ON DUPLICATE KEY UPDATE description=VALUES(description)",
+            (name, description),
+        )
+    conn.commit()
+    conn.close()
 
 
 def purge_source(filename):
